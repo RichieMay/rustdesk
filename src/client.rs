@@ -693,11 +693,11 @@ impl Client {
         let start = std::time::Instant::now();
 
         let mut connect_futures = Vec::new();
-        let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+        let fut = crate::punch_tcp_bidirectional(peer, local_addr, connect_timeout, true);
         connect_futures.push(
             async move {
-                let conn = fut.await?;
-                Ok((conn, None, "TCP"))
+                let (conn, typ) = fut.await?;
+                Ok((conn, None, typ))
             }
             .boxed(),
         );

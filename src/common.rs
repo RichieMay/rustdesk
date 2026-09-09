@@ -26,6 +26,7 @@ use hbb_common::{
     protobuf::{Enum, Message as _},
     rendezvous_proto::*,
     socket_client,
+    tcp::new_listener,
     sodiumoxide::crypto::{box_, secretbox, sign},
     timeout,
     tls::{get_cached_tls_accept_invalid_cert, get_cached_tls_type, upsert_tls_cache, TlsType},
@@ -2497,6 +2498,113 @@ pub async fn test_ipv6() -> Option<tokio::task::JoinHandle<()>> {
             }
         };
     }))
+}
+
+pub async fn punch_tcp_bidirectional(
+    peer_addr: SocketAddr,
+    local_addr: SocketAddr,
+    ms_timeout: u64,
+    prefer_active: bool,
+) -> ResultType<(Stream, &'static str)> {
+    let listener = match new_listener(local_addr, true).await {
+        Ok(listener) => {
+            log::info!("TCP punch listener on: {}", listener.local_addr()?);
+            Some(listener)
+        }
+        Err(err) => {
+            log::warn!("TCP punch listener failed on {local_addr}: {err}");
+            None
+        }
+    };
+
+    if listener.is_none() {
+        let active = socket_client::connect_tcp_local(peer_addr, Some(local_addr), ms_timeout).await?;
+        log::info!("TCP punch selected active connection without listener");
+        return Ok((active, "TCP"));
+    }
+
+    let active = socket_client::connect_tcp_local(peer_addr, Some(local_addr), ms_timeout);
+    let passive = async move {
+        let listener = listener.unwrap();
+        if let Ok((stream, addr)) = timeout(ms_timeout, listener.accept()).await? {
+            if addr.ip() != peer_addr.ip() {
+                bail!("TCP punch rejected connection from {addr}");
+            }
+            stream.set_nodelay(true).ok();
+            let stream_addr = stream.local_addr()?;
+            log::info!("TCP punch accepted from {}", addr);
+            Ok(Stream::from(stream, stream_addr))
+        } else {
+            bail!("TCP punch listener timed out");
+        }
+    };
+    tokio::pin!(active);
+    tokio::pin!(passive);
+
+    let mut active_res = None;
+    let mut passive_res = None;
+    tokio::select! {
+        res = &mut active => active_res = Some(res),
+        res = &mut passive => passive_res = Some(res),
+    }
+
+    // The preferred path succeeds: settle immediately to keep original latency
+    // and to stay consistent with official client behavior.
+    if prefer_active && matches!(&active_res, Some(Ok(_))) {
+        log::info!("TCP punch selected active connection");
+        return Ok((active_res.unwrap().unwrap(), "TCP"));
+    }
+    if !prefer_active && matches!(&passive_res, Some(Ok(_))) {
+        log::info!("TCP punch selected passive connection");
+        return Ok((passive_res.unwrap().unwrap(), "TCP"));
+    }
+
+    // Otherwise (backup path already succeeded, or the first one failed): if a
+    // backup is in hand, give the preferred path only a short (300ms) grace
+    // window instead of waiting for the full connect timeout; if nothing is in
+    // hand yet, wait for the remaining candidate under its own timeout.
+    let has_backup = matches!(&active_res, Some(Ok(_))) || matches!(&passive_res, Some(Ok(_)));
+    if has_backup {
+        tokio::select! {
+            _ = hbb_common::sleep(0.3) => {}
+            res = &mut active, if active_res.is_none() => active_res = Some(res),
+            res = &mut passive, if passive_res.is_none() => passive_res = Some(res),
+        }
+    } else {
+        tokio::select! {
+            res = &mut active, if active_res.is_none() => active_res = Some(res),
+            res = &mut passive, if passive_res.is_none() => passive_res = Some(res),
+        }
+    }
+
+    match (active_res, passive_res) {
+        (Some(Ok(active)), Some(Ok(passive))) => {
+            if prefer_active {
+                log::info!("TCP punch selected active connection");
+                drop(passive);
+                Ok((active, "TCP"))
+            } else {
+                log::info!("TCP punch selected passive connection");
+                drop(active);
+                Ok((passive, "TCP"))
+            }
+        }
+        (Some(Ok(active)), _) => {
+            log::info!("TCP punch selected active connection");
+            Ok((active, "TCP"))
+        }
+        (_, Some(Ok(passive))) => {
+            log::info!("TCP punch selected passive connection");
+            Ok((passive, "TCP"))
+        }
+        (Some(Err(active_err)), Some(Err(passive_err))) => {
+            bail!("TCP punch failed: active={active_err}, passive={passive_err}");
+        }
+        (Some(Err(err)), None) | (None, Some(Err(err))) => {
+            bail!("TCP punch failed: {err}");
+        }
+        _ => bail!("TCP punch failed"),
+    }
 }
 
 pub async fn punch_udp(
